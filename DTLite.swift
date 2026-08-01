@@ -475,6 +475,9 @@ struct GenerateExecutionOptions: ParsableArguments {
       "Disable network access. Uses cached community catalogs and recommended settings only, and never downloads models."
   )
   var offline: Bool = false
+
+  @Flag(name: .long, help: "Disable Metal FlashAttention.")
+  var noFlashAttention: Bool = false
 }
 
 struct GenerateAVCOptions: ParsableArguments {
@@ -2991,6 +2994,9 @@ extension DTLite {
 
     mutating func run() throws {
       NetworkAccessPolicy.offline = execution.offline
+      if execution.noFlashAttention {
+        DeviceCapability.isMFAEnabled.store(0, ordering: .releasing)
+      }
       if avc.enabled {
         try runLongCatAvatarAVC()
         return
