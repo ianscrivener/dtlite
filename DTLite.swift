@@ -152,7 +152,7 @@ private enum CLIHelpText {
       Run local Draw Things inference from the command line.
 
     COMMON COMMANDS:
-      \(CLIIdentity.command("generate --model flux_2_klein_4b_q6p.ckpt --prompt \"a red cube on a table\""))
+      \(CLIIdentity.command("generate --model /path/model.ckpt --vae /path/vae.ckpt --text-encoder /path/encoder.ckpt --prompt \"a red cube on a table\""))
       \(CLIIdentity.command("models list --downloaded-only"))
       \(CLIIdentity.command("models ensure --model flux_2_dev_q8p.ckpt"))
       \(CLIIdentity.command("completion zsh"))
@@ -167,18 +167,22 @@ private enum CLIHelpText {
 
   static let generate = """
     DESCRIPTION:
-      Resolve a local inference model, load recommended settings, apply JSON overrides,
-      then apply explicit command-line overrides before generation.
+      Load a model from explicit file paths, apply JSON overrides, then apply explicit
+      command-line overrides before generation. --model, --vae, and --text-encoder are
+      exact files: no name/catalog resolution and no directory search, so there is never
+      ambiguity about which weights are actually used.
 
-    MODEL REFERENCES:
-      --model accepts a model file id, a human-readable model name, an hf://owner/repo
-      reference, an owner/repo reference, or a Hugging Face model URL.
+    MODEL FILES:
+      --model, --vae, and --text-encoder each take a full path to a checkpoint file.
+      The model's architecture (version, latent scaling, etc.) is still looked up by
+      matching --model's filename against the built-in/community catalog; only the
+      files actually loaded are overridden to the exact paths given.
 
     CONFIGURATION PRECEDENCE:
-      1. Recommended settings for the resolved model.
+      1. Recommended settings for the resolved model's architecture.
       2. Overrides from --config-json or --config-file.
       3. Explicit command-line flags such as --steps, --cfg, --width, --height,
-         --frames, --seed, and --strength.
+         --frames, --seed, --strength, --sampler, and --shift.
       4. --negative-prompt overrides any recommended negative prompt.
 
     AUDIO VIDEO CONTINUATION:
@@ -187,11 +191,9 @@ private enum CLIHelpText {
       --segment-frames and --cond-frames to control continuation segments.
 
     EXAMPLES:
-      \(CLIIdentity.command("generate --model flux_2_klein_4b_q6p.ckpt --prompt \"a red cube on a table\""))
-      \(CLIIdentity.command("generate --model flux_2_klein_4b_q6p.ckpt --prompt-file prompt.txt"))
-      \(CLIIdentity.command("generate --model flux_2_klein_4b_q6p.ckpt --prompt \"studio portrait\" --image input.png --strength 0.35"))
-      \(CLIIdentity.command("generate --model flux_2_klein_4b_q6p.ckpt --prompt \"a red cube on a table\" --terminal-image"))
-      \(CLIIdentity.command("generate --model ltx_2.3_22b_distilled_q6p.ckpt --prompt \"ocean waves at sunset\" --frames 49 --output clip.mov"))
+      \(CLIIdentity.command("generate --model /path/flux_2_klein_4b_q6p.ckpt --vae /path/flux_2_vae_f16.ckpt --text-encoder /path/t5_xxl_encoder_q6p.ckpt --prompt \"a red cube on a table\""))
+      \(CLIIdentity.command("generate --model /path/model.ckpt --vae /path/vae.ckpt --text-encoder /path/encoder.ckpt --sampler \"Euler A Trailing\" --shift 3 --prompt \"studio portrait\" --image input.png --strength 0.35"))
+      \(CLIIdentity.command("generate --model /path/model.ckpt --vae /path/vae.ckpt --text-encoder /path/encoder.ckpt --prompt \"a red cube on a table\" --terminal-image"))
       \(CLIIdentity.command("generate --avc --model longcat_video_avatar_1.5_dmd_i8x.ckpt --image man.png --audio man.mp3 --output man.mp4"))
     """
 
@@ -250,6 +252,22 @@ private let modelReferenceHelp = ArgumentHelp(
   "Model file, model name, or Hugging Face repo/URL.",
   discussion:
     "Accepted forms: flux_2_klein_4b_q6p.ckpt, \"FLUX.2 [klein] 4B (6-bit)\", hf://owner/repo, owner/repo, or https://huggingface.co/owner/repo."
+)
+
+private let modelPathHelp = ArgumentHelp(
+  "Full path to the model checkpoint file.",
+  discussion:
+    "Exact file, no name/catalog resolution or directory search. This is the file actually loaded, so there's no ambiguity about which weights are used."
+)
+
+private let vaePathHelp = ArgumentHelp(
+  "Full path to the autoencoder (VAE) checkpoint file.",
+  discussion: "Exact file, loaded as-is regardless of what the model's catalog entry recommends."
+)
+
+private let textEncoderPathHelp = ArgumentHelp(
+  "Full path to the text encoder checkpoint file.",
+  discussion: "Exact file, loaded as-is regardless of what the model's catalog entry recommends."
 )
 
 private let generateConfigJSONHelp = ArgumentHelp(
@@ -358,10 +376,14 @@ struct ModelsDirectoryOptions: ParsableArguments {
 }
 
 struct GenerateModelResolutionOptions: ParsableArguments {
-  @OptionGroup var modelsDirectoryOptions: ModelsDirectoryOptions
+  @Option(name: .shortAndLong, help: modelPathHelp)
+  var model: String
 
-  @Option(name: .shortAndLong, help: modelReferenceHelp)
-  var model: String?
+  @Option(name: .long, help: vaePathHelp)
+  var vae: String
+
+  @Option(name: .customLong("text-encoder"), help: textEncoderPathHelp)
+  var textEncoder: String
 }
 
 struct GeneratePromptOptions: ParsableArguments {
@@ -407,6 +429,16 @@ struct GenerateSamplingOptions: ParsableArguments {
 
   @Option(name: .shortAndLong, help: "Random seed.")
   var seed: UInt32?
+
+  @Option(
+    name: .long,
+    help:
+      "Sampler. Examples: \"UniPC Trailing\", \"Euler A\", \"DPM++ 2M Karras\", \"DDIM Trailing\"."
+  )
+  var sampler: String = "UniPC Trailing"
+
+  @Option(name: .long, help: "Shift value for the noise schedule.")
+  var shift: Float = 1
 }
 
 struct GenerateConfigurationOverrideOptions: ParsableArguments {
@@ -583,6 +615,29 @@ private enum ModelResolver {
   static func suggestions(_ input: String, limit: Int = 5) -> [ModelZoo.Specification] {
     return ModelZoo.candidateSpecifications(forModelReference: input, limit: limit)
   }
+}
+
+// Looks up architecture metadata (version, mmdit config, etc.) by matching the model's
+// filename against the built-in/community catalog, same as ModelResolver always has, but then
+// overrides file/autoencoder/textEncoder to the exact paths given on the command line so
+// there's no ambiguity about which files are actually loaded.
+private func resolvedModelSpecification(
+  modelURL: URL, vaeURL: URL, textEncoderURL: URL, modelsDirectory: URL
+) throws -> ModelZoo.Specification {
+  let modelBasename = modelURL.lastPathComponent
+  guard var specification = ModelResolver.resolve(modelBasename, modelsDirectory: modelsDirectory)
+  else {
+    throw unresolvedModelValidationError(modelBasename)
+  }
+  let originalFile = specification.file
+  specification.file = modelBasename
+  specification.autoencoder = vaeURL.lastPathComponent
+  specification.textEncoder = textEncoderURL.lastPathComponent
+  if specification.clipEncoder == originalFile {
+    specification.clipEncoder = modelBasename
+  }
+  ModelZoo.overrideMapping[modelBasename] = specification
+  return specification
 }
 
 private enum ConfigurationLoader {
@@ -2913,7 +2968,8 @@ private func validateLongCatTemporalFrameCount(_ frames: Int, flag: String) thro
 
 private func createConfiguration(
   modelSpecification: ModelZoo.Specification, steps: Int?, cfg: Float?, width: Int?, height: Int?,
-  frames: Int?, seed: UInt32?, strength: Float?, configJSON: String?, configFile: String?,
+  frames: Int?, seed: UInt32?, strength: Float?, sampler: String, shift: Float,
+  configJSON: String?, configFile: String?,
   modelsDirectory: URL
 ) throws -> ResolvedGenerationConfiguration {
   let resolvedConfiguration = try ConfigurationLoader.load(
@@ -2921,6 +2977,8 @@ private func createConfiguration(
     modelsDirectory: modelsDirectory)
   var builder = GenerationConfigurationBuilder(from: resolvedConfiguration.configuration)
   builder.model = modelSpecification.file
+  builder.sampler = SamplerType(from: sampler)
+  builder.shift = shift
   if let steps {
     guard steps >= 1 else { throw ValidationError("--steps must be >= 1") }
     builder.steps = UInt32(steps)
@@ -3005,10 +3063,13 @@ extension DTLite {
         throw ValidationError(
           "--segment-frames, --cond-frames, and --zero-audio-features require --avc.")
       }
-      let modelsDirectory = try ModelsDirectoryResolver.resolve(
-        path: modelResolution.modelsDirectoryOptions.modelsDir)
+      let modelURL = try resolvedLocalFileURL(modelResolution.model)
+      let vaeURL = try resolvedLocalFileURL(modelResolution.vae)
+      let textEncoderURL = try resolvedLocalFileURL(modelResolution.textEncoder)
+      let modelsDirectory = modelURL.deletingLastPathComponent()
       ModelZoo.isExternalUrlsPreferred = true
-      ModelZoo.externalUrls = [modelsDirectory]
+      ModelZoo.externalUrls = Array(
+        Set([modelURL, vaeURL, textEncoderURL].map { $0.deletingLastPathComponent() }))
       let writesOutputFile = output.output != nil
       let outputPath =
         output.output
@@ -3029,21 +3090,15 @@ extension DTLite {
         outputPath: outputPath, mode: terminalImageMode,
         protocolChoice: output.terminalImageProtocol, requiresRenderableOutput: !writesOutputFile)
 
-      guard let model = modelResolution.model else {
-        printModelResolutionHelp(modelsDirectory: modelsDirectory)
-        throw ValidationError("--model is required.")
-      }
-      guard
-        let modelSpecification = ModelResolver.resolve(model, modelsDirectory: modelsDirectory)
-      else {
-        printModelResolutionHelp(modelsDirectory: modelsDirectory)
-        throw unresolvedModelValidationError(model)
-      }
+      let modelSpecification = try resolvedModelSpecification(
+        modelURL: modelURL, vaeURL: vaeURL, textEncoderURL: textEncoderURL,
+        modelsDirectory: modelsDirectory)
 
       let resolvedConfiguration = try createConfiguration(
         modelSpecification: modelSpecification, steps: sampling.steps, cfg: sampling.cfg,
         width: sampling.width, height: sampling.height, frames: sampling.frames,
-        seed: sampling.seed, strength: sampling.strength,
+        seed: sampling.seed, strength: sampling.strength, sampler: sampling.sampler,
+        shift: sampling.shift,
         configJSON: configurationOverrides.configJSON,
         configFile: configurationOverrides.configFile,
         modelsDirectory: modelsDirectory)
@@ -3183,20 +3238,16 @@ extension DTLite.Generate {
       throw DTLiteError.invalidOutputPath(outputURL.path)
     }
 
-    let modelsDirectory = try ModelsDirectoryResolver.resolve(
-      path: modelResolution.modelsDirectoryOptions.modelsDir)
+    let modelURL = try resolvedLocalFileURL(modelResolution.model)
+    let vaeURL = try resolvedLocalFileURL(modelResolution.vae)
+    let textEncoderURL = try resolvedLocalFileURL(modelResolution.textEncoder)
+    let modelsDirectory = modelURL.deletingLastPathComponent()
     ModelZoo.isExternalUrlsPreferred = true
-    ModelZoo.externalUrls = [modelsDirectory]
-    guard let model = modelResolution.model else {
-      printModelResolutionHelp(modelsDirectory: modelsDirectory)
-      throw ValidationError("--model is required.")
-    }
-    guard
-      let modelSpecification = ModelResolver.resolve(model, modelsDirectory: modelsDirectory)
-    else {
-      printModelResolutionHelp(modelsDirectory: modelsDirectory)
-      throw unresolvedModelValidationError(model)
-    }
+    ModelZoo.externalUrls = Array(
+      Set([modelURL, vaeURL, textEncoderURL].map { $0.deletingLastPathComponent() }))
+    let modelSpecification = try resolvedModelSpecification(
+      modelURL: modelURL, vaeURL: vaeURL, textEncoderURL: textEncoderURL,
+      modelsDirectory: modelsDirectory)
     guard ModelZoo.versionForModel(modelSpecification.file) == .longcatVideoAvatar1_5 else {
       throw ValidationError("--avc currently supports only LongCat-Video-Avatar 1.5 models.")
     }
@@ -3204,7 +3255,8 @@ extension DTLite.Generate {
     let resolvedConfiguration = try createConfiguration(
       modelSpecification: modelSpecification, steps: sampling.steps, cfg: sampling.cfg,
       width: sampling.width, height: sampling.height, frames: segmentFrames,
-      seed: sampling.seed, strength: sampling.strength,
+      seed: sampling.seed, strength: sampling.strength, sampler: sampling.sampler,
+      shift: sampling.shift,
       configJSON: configurationOverrides.configJSON,
       configFile: configurationOverrides.configFile,
       modelsDirectory: modelsDirectory)
