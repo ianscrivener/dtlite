@@ -3716,6 +3716,137 @@ private func loadInputImageTensor(path: String, imageWidth: Int, imageHeight: In
   return tensor
 }
 
+// Despite the name (inherited from the upstream training-data loader this was factored out
+// of), this decodes/resizes/center-crops any PNG or platform image to a tensor and is also
+// the img2img input-loading path for Generate.
+private func loadTrainingTensor(
+  url: URL, imageWidth: Int, imageHeight: Int
+) -> (
+  Tensor<FloatType>, (width: Int, height: Int), (top: Int, left: Int), (width: Int, height: Int)
+)? {
+  if let image = try? PNG.Data.Rectangular.decompress(path: url.path) {
+    let rgba: [PNG.RGBA<UInt8>] = image.unpack(as: PNG.RGBA<UInt8>.self)
+    let sourceWidth = image.size.x
+    let sourceHeight = image.size.y
+
+    var scaledWidth: Int
+    var scaledHeight: Int
+    if sourceWidth * imageHeight > sourceHeight * imageWidth {
+      scaledHeight = imageHeight
+      scaledWidth = Int(
+        (Double(sourceWidth) * Double(imageHeight) / Double(sourceHeight)).rounded())
+    } else {
+      scaledWidth = imageWidth
+      scaledHeight = Int(
+        (Double(sourceHeight) * Double(imageWidth) / Double(sourceWidth)).rounded())
+    }
+
+    let offsetX = (scaledWidth - imageWidth) / 2
+    let offsetY = (scaledHeight - imageHeight) / 2
+    var tensor = Tensor<FloatType>(.CPU, .NHWC(1, imageHeight, imageWidth, 3))
+    for y in 0..<imageHeight {
+      for x in 0..<imageWidth {
+        let srcX = Int(Double(x + offsetX) * Double(sourceWidth) / Double(scaledWidth))
+        let srcY = Int(Double(y + offsetY) * Double(sourceHeight) / Double(scaledHeight))
+        let clampedX = min(max(srcX, 0), sourceWidth - 1)
+        let clampedY = min(max(srcY, 0), sourceHeight - 1)
+        let pixel = rgba[clampedY * sourceWidth + clampedX]
+        tensor[0, y, x, 0] = FloatType(Float(pixel.r) / 127.5 - 1)
+        tensor[0, y, x, 1] = FloatType(Float(pixel.g) / 127.5 - 1)
+        tensor[0, y, x, 2] = FloatType(Float(pixel.b) / 127.5 - 1)
+      }
+    }
+
+    let top = Int(
+      (Double(max(scaledWidth - imageWidth, 0))
+        * (Double(sourceWidth) / Double(max(scaledWidth, 1)))
+        / 2).rounded())
+    let left = Int(
+      (Double(max(scaledHeight - imageHeight, 0))
+        * (Double(sourceHeight) / Double(max(scaledHeight, 1)))
+        / 2).rounded())
+    let originalWidth = Int(
+      (Double(imageWidth) * Double(sourceWidth) / Double(max(scaledWidth, 1))).rounded())
+    let originalHeight = Int(
+      (Double(imageHeight) * Double(sourceHeight) / Double(max(scaledHeight, 1))).rounded())
+    return (
+      tensor, (width: originalWidth, height: originalHeight), (top: top, left: left),
+      (width: imageWidth, height: imageHeight)
+    )
+  }
+
+  #if canImport(ImageIO) && canImport(CoreGraphics)
+    guard
+      let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+      let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
+    else {
+      return nil
+    }
+
+    let cgImageWidth = cgImage.width
+    let cgImageHeight = cgImage.height
+
+    var scaledWidth: Int
+    var scaledHeight: Int
+    if cgImageWidth * imageHeight > cgImageHeight * imageWidth {
+      scaledHeight = imageHeight
+      scaledWidth = Int(
+        (Double(cgImageWidth) * Double(imageHeight) / Double(cgImageHeight)).rounded())
+    } else {
+      scaledWidth = imageWidth
+      scaledHeight = Int(
+        (Double(cgImageHeight) * Double(imageWidth) / Double(cgImageWidth)).rounded())
+    }
+
+    guard
+      let bitmapContext = CGContext(
+        data: nil, width: imageWidth, height: imageHeight, bitsPerComponent: 8,
+        bytesPerRow: imageWidth * 4, space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+          | CGImageAlphaInfo.premultipliedLast.rawValue)
+    else {
+      return nil
+    }
+    bitmapContext.interpolationQuality = .high
+    bitmapContext.draw(
+      cgImage,
+      in: CGRect(
+        x: (imageWidth - scaledWidth) / 2, y: (imageHeight - scaledHeight) / 2, width: scaledWidth,
+        height: scaledHeight))
+
+    guard let data = bitmapContext.data else { return nil }
+    let rgba = data.assumingMemoryBound(to: UInt8.self)
+    var tensor = Tensor<FloatType>(.CPU, .NHWC(1, imageHeight, imageWidth, 3))
+    for y in 0..<imageHeight {
+      for x in 0..<imageWidth {
+        let i = (y * imageWidth + x) * 4
+        tensor[0, y, x, 0] = FloatType(Float(rgba[i]) / 127.5 - 1)
+        tensor[0, y, x, 1] = FloatType(Float(rgba[i + 1]) / 127.5 - 1)
+        tensor[0, y, x, 2] = FloatType(Float(rgba[i + 2]) / 127.5 - 1)
+      }
+    }
+
+    let top = Int(
+      (Double(max(scaledWidth - imageWidth, 0))
+        * (Double(cgImageWidth) / Double(max(scaledWidth, 1)))
+        / 2).rounded())
+    let left = Int(
+      (Double(max(scaledHeight - imageHeight, 0))
+        * (Double(cgImageHeight) / Double(max(scaledHeight, 1)))
+        / 2).rounded())
+    let originalWidth = Int(
+      (Double(imageWidth) * Double(cgImageWidth) / Double(max(scaledWidth, 1))).rounded())
+    let originalHeight = Int(
+      (Double(imageHeight) * Double(cgImageHeight) / Double(max(scaledHeight, 1))).rounded())
+    return (
+      tensor, (width: originalWidth, height: originalHeight), (top: top, left: left),
+      (width: imageWidth, height: imageHeight)
+    )
+  #else
+    return nil
+  #endif
+}
+
 private func longCatImageInput(
   referenceImage: Tensor<FloatType>, continuationFrames: ArraySlice<Tensor<FloatType>>,
   condFrames: Int
