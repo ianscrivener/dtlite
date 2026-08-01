@@ -194,7 +194,7 @@ private enum CLIHelpText {
       \(CLIIdentity.command("generate --model /path/flux_2_klein_4b_q6p.ckpt --vae /path/flux_2_vae_f16.ckpt --text-encoder /path/t5_xxl_encoder_q6p.ckpt --prompt \"a red cube on a table\""))
       \(CLIIdentity.command("generate --model /path/model.ckpt --vae /path/vae.ckpt --text-encoder /path/encoder.ckpt --sampler \"Euler A Trailing\" --shift 3 --prompt \"studio portrait\" --image input.png --strength 0.35"))
       \(CLIIdentity.command("generate --model /path/model.ckpt --vae /path/vae.ckpt --text-encoder /path/encoder.ckpt --prompt \"a red cube on a table\" --terminal-image"))
-      \(CLIIdentity.command("generate --avc --model longcat_video_avatar_1.5_dmd_i8x.ckpt --image man.png --audio man.mp3 --output man.mp4"))
+      \(CLIIdentity.command("generate --avc --model /path/longcat_video_avatar_1.5_dmd_i8x.ckpt --vae /path/vae.ckpt --text-encoder /path/encoder.ckpt --image man.png --audio man.mp3 --output man.mp4"))
     """
 
   static let models = """
